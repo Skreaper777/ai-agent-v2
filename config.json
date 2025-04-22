@@ -19,5 +19,5 @@
 
   "//": "пикселя в кадр",
   "player_speed": 2,
-  "agent_speed": 1.4
+  "agent_speed": 10.4
 }

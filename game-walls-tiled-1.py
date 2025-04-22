@@ -1,193 +1,191 @@
-"""game-walls-tiled-1.py — запуск игры с умным агентом"""
-import os
-os.environ["SDL_VIDEO_WINDOW_POS"] = "1800,100"
+"""game-walls-tiled-1.py — запуск игры с Амелией‑ботом и Адамом
+Полная версия, совместимая с актуальным agent_motivated.py
+"""
 
-# --- библиотеки ---
-import sys, math, json, random
+import os; os.environ["SDL_VIDEO_WINDOW_POS"] = "1800,100"
+import sys, math, json
 from pathlib import Path
 import pygame
 
 from agent_motivated import Agent
 
-# ------------------- Конфиг -------------------
+# -----------------------------------------------------------------------------
+# 1️⃣ Конфиг и константы
+# -----------------------------------------------------------------------------
 CFG = json.loads(Path("config.json").read_text(encoding="utf-8"))
-WIN_W, WIN_H = CFG["window_size"]["width"], CFG["window_size"]["height"]
-SIDE_W       = CFG.get("side_panel_width", 200)
-BG_COLOR     = tuple(CFG["background_color"])
+WIN_W, WIN_H, SIDE_W = CFG["window_size"]["width"], CFG["window_size"]["height"], CFG["side_panel_width"]
+BG_COLOR             = tuple(CFG["background_color"])
 
-TILE_W, TILE_H = CFG["tile_size"]["w"], CFG["tile_size"]["h"]
-TILESET_PATH   = CFG["tileset_path"]
-ADAM_SPRITE    = CFG["adam_sprite_path"]
-ADAM_COL, ADAM_ROW   = CFG["adam_start"]["col"], CFG["adam_start"]["row"]
+TILE_W, TILE_H       = CFG["tile_size"]["w"], CFG["tile_size"]["h"]
+TILESET_PATH         = CFG["tileset_path"]
+
+# спрайты
+ADAM_SPRITE   = CFG["adam_sprite_path"]
+AGENT_SPRITE  = CFG["agent_sprite_path"]
+
+# стартовые позиции
+ADAM_COL, ADAM_ROW   = CFG["adam_start"]["col"],  CFG["adam_start"]["row"]
 AGENT_COL, AGENT_ROW = CFG["agent_start"]["col"], CFG["agent_start"]["row"]
 
-# ------------- Pygame -------------
+# скорости (пикселей в кадр при 60 FPS)
+ADAM_SPEED  = CFG["player_speed"]
+AGENT_SPEED = CFG["agent_speed"]
+
+# -----------------------------------------------------------------------------
+# 2️⃣ Инициализация Pygame
+# -----------------------------------------------------------------------------
 pygame.init()
-screen = pygame.display.set_mode((WIN_W + SIDE_W, WIN_H))
-pygame.display.set_caption("Комната, Адам и умный агент")
+screen = pygame.display.set_mode((WIN_W+SIDE_W, WIN_H))
+pygame.display.set_caption("Комната, Адам и Амелия‑бот")
 font  = pygame.font.SysFont("consolas", 16)
 clock = pygame.time.Clock()
 
-# ------------------- Карта Tiled -------------------
+# -----------------------------------------------------------------------------
+# 3️⃣ Загрузка карты Tiled
+# -----------------------------------------------------------------------------
 MAP = json.loads(Path("map.json").read_text(encoding="utf-8"))
-MAP_COLS, MAP_ROWS = MAP["width"], MAP["height"]
-
-layer_tiles = next(l for l in MAP["layers"] if l["type"] == "tilelayer")
-map_gids = layer_tiles["data"]
+COLS, ROWS = MAP["width"], MAP["height"]
+layer_tiles = next(l for l in MAP["layers"] if l["type"]=="tilelayer")
+map_gids    = layer_tiles["data"]
 
 ts_meta   = MAP["tilesets"][0]
-first_gid, cols_ts = ts_meta["firstgid"], ts_meta["columns"]
+first_gid = ts_meta["firstgid"]; cols_ts = ts_meta["columns"]
 tileset_img = pygame.image.load(TILESET_PATH).convert_alpha()
 
-tile_surfs: dict[int, pygame.Surface] = {}
+# тайловые Surface'ы
+tiles={}
 for gid in {g for g in map_gids if g}:
-    idx = gid - first_gid
-    sx, sy = (idx % cols_ts)*TILE_W, (idx // cols_ts)*TILE_H
-    tile_surfs[gid] = tileset_img.subsurface((sx, sy, TILE_W, TILE_H))
+    idx = gid-first_gid
+    sx,sy = (idx%cols_ts)*TILE_W, (idx//cols_ts)*TILE_H
+    tiles[gid] = tileset_img.subsurface((sx,sy,TILE_W,TILE_H))
 
-# --- коллизии ---
-coll_shapes: dict[int, list[pygame.Rect]] = {}
-for t in ts_meta.get("tiles", []):
-    gid = first_gid + t["id"]
-    objs = t.get("objectgroup", {}).get("objects", [])
-    if objs:
-        coll_shapes[gid] = [pygame.Rect(o["x"], o["y"], o["width"], o["height"]) for o in objs]
+def blocked(col,row): return map_gids[row*COLS+col]!=0
 
-# --- зоны ---
-zone_rects: dict[str, pygame.Rect] = {}
+# зоны
+zone_rects={}
 for l in MAP["layers"]:
-    if l["type"] == "objectgroup" and l["name"] == "zones":
+    if l["type"]=="objectgroup" and l["name"]=="zones":
         for obj in l["objects"]:
             for prop in obj.get("properties", []):
-                if prop["name"] == "zone":
-                    zone_rects[prop["value"]] = pygame.Rect(obj["x"], obj["y"],
-                                                            obj["width"], obj["height"])
+                if prop["name"]=="zone":
+                    zone_rects[prop["value"]]=pygame.Rect(obj["x"],obj["y"],obj["width"],obj["height"])
 
-# ------------------- Игрок -------------------
-FRAME_W, FRAME_H, SCALE = 16, 32, 2
-SW, SH = FRAME_W*SCALE, FRAME_H*SCALE
-PLAYER_SPEED, ANIM_SPEED = 2, 0.12
+# -----------------------------------------------------------------------------
+# 4️⃣ Спрайты Адама и Амелии
+# -----------------------------------------------------------------------------
+FRAME_W, FRAME_H = 16, 32              # исходный размер персонажей
+ASCALE = TILE_W // 16                 # масштаб до ширины тайла (48//16=3)
+SW, SH  = FRAME_W*ASCALE, FRAME_H*ASCALE
 
+# игрок (Адам)
 adam_sheet = pygame.image.load(ADAM_SPRITE).convert_alpha()
-adam_frames = [[pygame.transform.scale(
-                    adam_sheet.subsurface(((d*6+i)*FRAME_W, 0, FRAME_W, FRAME_H)),
-                    (SW, SH))
-                for i in range(6)] for d in range(4)]
+adam_frames=[[pygame.transform.scale(adam_sheet.subsurface(((d*6+i)*FRAME_W,0,FRAME_W,FRAME_H)),(SW,SH))
+              for i in range(6)] for d in range(4)]
 
-adam_x = ADAM_COL*TILE_W + TILE_W//2
-adam_y = ADAM_ROW*TILE_H + TILE_H//2
-frame_idx, anim_t, adam_dir = 0, 0.0, 3
+adam_x = ADAM_COL*TILE_W+TILE_W//2
+adam_y = ADAM_ROW*TILE_H+TILE_H//2
+adam_dir, adam_frame, anim_t = 3,0,0.0
 
-# ------------------- Мир + агент -------------------
-class WorldAdapter:
-    def __init__(self, gids, coll, w, h):
-        self.gids, self.coll, self.size = gids, coll, (w, h)
-    def in_bounds(self, p):  return 0 <= p[0] < self.size[0] and 0 <= p[1] < self.size[1]
-    def is_blocked(self, p): return self.gids[p[1]*self.size[0] + p[0]] in self.coll
+# агент (Амелия)
+agent_sheet = pygame.image.load(AGENT_SPRITE).convert_alpha()
+agent_frames=[[pygame.transform.scale(agent_sheet.subsurface(((d*6+i)*16,0,16,16)),(SW,SH))
+               for i in range(6)] for d in range(4)]
 
-world = WorldAdapter(map_gids, coll_shapes, MAP_COLS, MAP_ROWS)
+# -----------------------------------------------------------------------------
+# 5️⃣ Адаптер мира + правила + создание агента
+# -----------------------------------------------------------------------------
+class World:
+    def __init__(self):
+        self.size = (COLS, ROWS)
+        self.ts   = TILE_W
+    def in_bounds(self,p):  return 0<=p[0]<COLS and 0<=p[1]<ROWS
+    def is_blocked(self,p): return blocked(*p)
+world = World()
 
-home_tiles = []
-if (home_rect := zone_rects.get("home")):
-    for ty in range(MAP_ROWS):
-        for tx in range(MAP_COLS):
-            if home_rect.collidepoint(tx*TILE_W+TILE_W//2, ty*TILE_H+TILE_H//2):
-                home_tiles.append((tx, ty))
+rules = json.loads(Path("agent_rules.json").read_text(encoding="utf-8"))
 
-agent = Agent((AGENT_COL, AGENT_ROW), world, {"home": home_tiles})
+home_tiles=[]
+if (rect:=zone_rects.get("home")):
+    for r in range(ROWS):
+        for c in range(COLS):
+            if rect.collidepoint(c*TILE_W+TILE_W//2,r*TILE_H+TILE_H//2):
+                home_tiles.append((c,r))
 
-# ------------------- Игровой цикл -------------------
-running = True
+agent = Agent((AGENT_COL,AGENT_ROW), world, {"home":home_tiles},
+              rules, agent_frames, AGENT_SPEED)
+agent.load_memory()
+
+# -----------------------------------------------------------------------------
+# 6️⃣ Вспомогательные функции
+# -----------------------------------------------------------------------------
+def feet_ok(px,py):
+    rect=pygame.Rect(px-SW*0.25, py-SH*0.25, SW*0.5, SH*0.25)
+    c0,c1=max(0,rect.left//TILE_W),min(COLS,rect.right//TILE_W+1)
+    r0,r1=max(0,rect.top //TILE_H),min(ROWS,rect.bottom//TILE_H+1)
+    for r in range(r0,r1):
+        for c in range(c0,c1):
+            if blocked(c,r): return False
+    return True
+
+# -----------------------------------------------------------------------------
+# 7️⃣ Игровой цикл
+# -----------------------------------------------------------------------------
+running=True
 while running:
-    dt = clock.tick(60)/1000.0
-
-    # -- события --
+    dt=clock.tick(60)/1000
     for ev in pygame.event.get():
-        if ev.type == pygame.QUIT:
-            running = False
+        if ev.type==pygame.QUIT: running=False
+        if ev.type==pygame.KEYDOWN and ev.key==pygame.K_m:
+            agent.save_memory()
 
-    # -- управление игроком --
-    keys = pygame.key.get_pressed()
-    vx = (keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]) * PLAYER_SPEED
-    vy = (keys[pygame.K_DOWN]  - keys[pygame.K_UP])   * PLAYER_SPEED
+    # --- управление Адамом ---
+    k=pygame.key.get_pressed()
+    vx=(k[pygame.K_RIGHT]-k[pygame.K_LEFT])*ADAM_SPEED
+    vy=(k[pygame.K_DOWN ]-k[pygame.K_UP  ])*ADAM_SPEED
     if vx and vy:
-        n = math.hypot(vx, vy); vx, vy = vx/n*PLAYER_SPEED, vy/n*PLAYER_SPEED
-
+        n=math.hypot(vx,vy); vx,vy=vx/n*ADAM_SPEED,vy/n*ADAM_SPEED
     if vx>0: adam_dir=0
     elif vx<0: adam_dir=2
     elif vy<0: adam_dir=1
     elif vy>0: adam_dir=3
+    if feet_ok(adam_x+vx, adam_y+vy): adam_x+=vx; adam_y+=vy
 
-    # -- коллизия ног --
-    def feet_ok(nx, ny):
-        rect = pygame.Rect(nx - SW*0.25, ny - SH*0.25, SW*0.5, SH*0.25)
-        c0, c1 = max(0, rect.left//TILE_W), min(MAP_COLS, rect.right//TILE_W+1)
-        r0, r1 = max(0, rect.top //TILE_H), min(MAP_ROWS, rect.bottom//TILE_H+1)
-        for r in range(r0, r1):
-            for c in range(c0, c1):
-                gid = map_gids[r*MAP_COLS+c]
-                if gid==0: continue
-                if gid in coll_shapes:
-                    for s in coll_shapes[gid]:
-                        if rect.colliderect(pygame.Rect(c*TILE_W+s.x, r*TILE_H+s.y, s.w, s.h)):
-                            return False
-                else:
-                    if rect.colliderect(pygame.Rect(c*TILE_W, r*TILE_H, TILE_W, TILE_H)):
-                        return False
-        return True
+    if vx or vy:
+        anim_t+=dt*8
+        if anim_t>1: anim_t=0; adam_frame=(adam_frame+1)%6
+    else: adam_frame=0
 
-    if feet_ok(adam_x+vx, adam_y+vy):
-        adam_x += vx; adam_y += vy
+    # --- логика агента ---
+    agent.tick(dt)
 
-    # -- логика агента --
-    agent.tick()
-
-    # -- анимация игрока --
-    moving = vx or vy
-    if moving:
-        anim_t += ANIM_SPEED
-        if anim_t >= 1: anim_t, frame_idx = 0, (frame_idx+1)%6
-    else:
-        frame_idx = 0
-
-    # ------------------- Рендер -------------------
+    # -------------------------------------------------------------------------
+    # 8️⃣  Рендер
+    # -------------------------------------------------------------------------
     screen.fill(BG_COLOR)
+    for r in range(ROWS):
+        for c in range(COLS):
+            gid=map_gids[r*COLS+c]
+            if gid: screen.blit(tiles[gid],(c*TILE_W,r*TILE_H))
 
-    # тайлы
-    for r in range(MAP_ROWS):
-        for c in range(MAP_COLS):
-            gid = map_gids[r*MAP_COLS + c]
-            if gid and gid in tile_surfs:
-                screen.blit(tile_surfs[gid], (c*TILE_W, r*TILE_H))
+    if rect:=zone_rects.get("home"):
+        s=pygame.Surface(rect.size,pygame.SRCALPHA); s.fill((0,0,255,60))
+        screen.blit(s,rect.topleft)
+        screen.blit(font.render("дом",True,(255,255,255)),(rect.x+4,rect.y+4))
 
-    # зона home
-    if home_rect:
-        tmp = pygame.Surface(home_rect.size, pygame.SRCALPHA)
-        tmp.fill((0,0,255,60))
-        screen.blit(tmp, home_rect.topleft)
-        screen.blit(font.render("home", True, (255,255,255)), (home_rect.x+4, home_rect.y+4))
-
-    # спрайт игрока
-    screen.blit(adam_frames[adam_dir][frame_idx], (adam_x-SW//2, adam_y-SH))
-
-    # путь и позиция агента
-    agent.draw_path(screen, TILE_W)
-    pygame.draw.rect(screen, (255,0,0),
-                     (agent.pos[0]*TILE_W, agent.pos[1]*TILE_H, TILE_W, TILE_H), 2)
+    # персонажи
+    screen.blit(adam_frames[adam_dir][adam_frame],(adam_x-SW//2,adam_y-SH))
+    agent.draw(screen); agent.draw_path(screen,TILE_W)
 
     # UI
-    agent.draw_ui(screen, WIN_W+10, 20)
+    screen.blit(font.render(f"Мотивация: {agent.motivation.value}",True,(255,255,255)),(WIN_W+10,20))
 
     # мини‑карта памяти
-    mem = agent.mem.grid
-    mini = pygame.Surface((mem.shape[1], mem.shape[0]))
-    for y in range(mem.shape[0]):
-        for x in range(mem.shape[1]):
-            v = mem[y,x]
-            mini.set_at((x,y), (40,40,40) if v==-1 else (100,100,100) if v==0 else (180,180,255))
-    screen.blit(pygame.transform.scale(mini, (mem.shape[1]*2, mem.shape[0]*2)), (WIN_W+10, 120))
+    g=agent.mem.grid; mini=pygame.Surface((g.shape[1],g.shape[0]))
+    for y in range(g.shape[0]):
+        for x in range(g.shape[1]):
+            v=g[y,x]; mini.set_at((x,y),(40,40,40) if v==-1 else (100,100,100) if v==0 else (180,180,255))
+    screen.blit(pygame.transform.scale(mini,(g.shape[1]*2,g.shape[0]*2)),(WIN_W+10,60))
 
     pygame.display.flip()
 
-pygame.quit()
-sys.exit()
+pygame.quit(); sys.exit()
