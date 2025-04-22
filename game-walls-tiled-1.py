@@ -1,7 +1,9 @@
 import os
 os.environ['SDL_VIDEO_WINDOW_POS'] = "1800,100"
 
-import pygame, sys, math, json
+import pygame, sys, math, json, torch
+import torch.nn as nn
+import numpy as np
 
 # 1) Конфиг
 with open("config.json", encoding="utf-8") as f:
@@ -9,27 +11,20 @@ with open("config.json", encoding="utf-8") as f:
 
 WINDOW_WIDTH     = cfg["window_size"]["width"]
 WINDOW_HEIGHT    = cfg["window_size"]["height"]
-SIDE_PANEL_WIDTH = cfg.get("side_panel_width", 200)
 BG_COLOR         = tuple(cfg["background_color"])
 TILESET_PATH     = cfg["tileset_path"]
 ADAM_SPRITE_PATH = cfg["adam_sprite_path"]
 TILE_W, TILE_H   = cfg["tile_size"]["w"], cfg["tile_size"]["h"]
 
-# Новые настройки «ступней»
 FOOT_W_RATIO = cfg["foot_collision"]["width_ratio"]
 FOOT_H_RATIO = cfg["foot_collision"]["height_ratio"]
-ADAM_COL = cfg["adam_start"]["col"]
-ADAM_ROW = cfg["adam_start"]["row"]
-AGENT_COL = cfg["agent_start"]["col"]
-AGENT_ROW = cfg["agent_start"]["row"]
 
 # 2) Инициализация Pygame и окно
 pygame.init()
-screen = pygame.display.set_mode((WINDOW_WIDTH + SIDE_PANEL_WIDTH, WINDOW_HEIGHT))
+screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 pygame.display.set_caption("Комната и Адам")
-font = pygame.font.SysFont(None, 24)
 
-# 3) Загрузка и парсинг map.json (включая tileset с objectgroup)
+# 3) Загрузка и парсинг map.json
 with open("map.json", encoding="utf-8") as f:
     map_data = json.load(f)
 
@@ -41,7 +36,7 @@ if map_data["tilewidth"] != TILE_W or map_data["tileheight"] != TILE_H:
 layer    = next(l for l in map_data["layers"] if l["type"] == "tilelayer")
 map_gids = layer["data"]
 
-# 4) Вырезаем все тайлы и парсим collision‑shapes
+# 4) Вырезаем все тайлы и коллизии
 tileset    = pygame.image.load(TILESET_PATH).convert_alpha()
 ts         = map_data["tilesets"][0]
 firstgid   = ts["firstgid"]
@@ -50,7 +45,6 @@ tilecount  = ts.get("tilecount", cols_ts * (ts["imageheight"]//TILE_H))
 
 tiles       = {}
 coll_shapes = {}
-zone_rects  = {}
 
 unique_gids = {gid for gid in map_gids if gid > 0}
 for gid in unique_gids:
@@ -68,16 +62,6 @@ for tile in ts.get("tiles", []):
     shapes = [pygame.Rect(o["x"], o["y"], o["width"], o["height"]) for o in objs]
     if shapes:
         coll_shapes[gid] = shapes
-
-# Обработка зон
-for layer in map_data["layers"]:
-    if layer["type"] == "objectgroup" and layer["name"] == "zones":
-        for obj in layer["objects"]:
-            for prop in obj.get("properties", []):
-                if prop["name"] == "zone":
-                    zone_name = prop["value"]
-                    rect = pygame.Rect(obj["x"], obj["y"], obj["width"], obj["height"])
-                    zone_rects[zone_name] = rect
 
 # 5) Спрайты Адама
 FRAME_W, FRAME_H = 16, 32
@@ -97,42 +81,113 @@ def slice_adam(sheet):
 
 adam_frames = slice_adam(adam_sheet)
 
-# **Зона столкновений «ступней»**
 FOOT_W = SW * FOOT_W_RATIO
 FOOT_H = SH * FOOT_H_RATIO
 
-adam_x = ADAM_COL * TILE_W + TILE_W//2
-adam_y = ADAM_ROW * TILE_H + TILE_H//2
-agent_x = AGENT_COL * TILE_W + TILE_W//2
-agent_y = AGENT_ROW * TILE_H + TILE_H//2
+# Стартовые координаты
+start_col = MAP_COLS // 2
+adam_x = start_col * TILE_W + TILE_W//2
+adam_y = (MAP_ROWS - 1) * TILE_H
+
+# Агент
+agent_x = adam_x + TILE_W * 2
+agent_y = adam_y
 
 frame_index = 0
 anim_timer  = 0
 current_dir = 3
 
+# === Модель ===
+class AgentNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(25, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = AgentNet()
+if os.path.exists("agent_model.pt"):
+    model.load_state_dict(torch.load("agent_model.pt"))
+    model.eval()
+    print("[✓] Модель загружена")
+else:
+    model = None
+    print("[!] Модель не найдена")
+
+recording = False
+repeating = False
+demo_buffer = []
+
+# === Вспомогательные ===
+def is_walkable(gid):
+    return gid not in coll_shapes
+
+def extract_vision(cx, cy):
+    result = []
+    for dy in range(-2, 3):
+        row = []
+        for dx in range(-2, 3):
+            tx, ty = cx + dx, cy + dy
+            if 0 <= tx < MAP_COLS and 0 <= ty < MAP_ROWS:
+                gid = map_gids[ty * MAP_COLS + tx]
+                walkable = 1 if is_walkable(gid) else 0
+            else:
+                walkable = 0
+            row.append(walkable)
+        result.append(row)
+    return result
+
+def get_action_from_keys(keys):
+    if keys[pygame.K_LEFT]:  return "left"
+    if keys[pygame.K_RIGHT]: return "right"
+    if keys[pygame.K_UP]:    return "up"
+    if keys[pygame.K_DOWN]:  return "down"
+    return None
+
+def model_predict_action(state):
+    if not model:
+        return None
+    flat = np.array(sum(state, []), dtype=np.float32)
+    tensor = torch.tensor(flat).unsqueeze(0)
+    with torch.no_grad():
+        output = model(tensor)
+        action = torch.argmax(output).item()
+    print("Predicted:", output.numpy(), "→", action)
+
+    return ["left", "right", "up", "down"][action]
+
+def save_demo_buffer():
+    with open("demo_buffer.json", "w", encoding="utf-8") as f:
+        json.dump(demo_buffer, f, indent=2, ensure_ascii=False)
+    print(f"[SAVED] {len(demo_buffer)} записей в demo_buffer.json")
+
+# === Игровой цикл ===
 clock = pygame.time.Clock()
 running = True
 
-# === Агентное состояние ===
-agent_state = {
-    "time_indoors": 0.0,
-    "time_outdoors": 0.0,
-    "want_to_go_home": 0.0,
-    "want_to_explore": 0.0,
-}
-
-# === Вспомогательные ===
-def is_in_zone(name, x, y):
-    z = zone_rects.get(name)
-    return z and z.collidepoint(x, y)
-
-# === Игровой цикл ===
 while running:
     dt = clock.tick(60) / 1000
     for ev in pygame.event.get():
         if ev.type == pygame.QUIT:
             running = False
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_r:
+                recording = not recording
+                print("[REC]" if recording else "[STOP]")
+            if ev.key == pygame.K_t:
+                repeating = not repeating
+                print("[T: AI ON]" if repeating else "[T: AI OFF]")
+            if ev.key == pygame.K_F5:
+                save_demo_buffer()
 
+    # === Управление Адамом ===
     keys = pygame.key.get_pressed()
     dx = dy = 0
     if keys[pygame.K_LEFT]:   dx -= speed
@@ -165,7 +220,6 @@ while running:
         for c in range(c0, c1):
             gid = map_gids[r*MAP_COLS + c]
             if gid == 0: continue
-
             shapes = coll_shapes.get(gid)
             if shapes:
                 for s in shapes:
@@ -184,70 +238,63 @@ while running:
         adam_x += dx
         adam_y += dy
 
-    # === Обновление мотиваций ===
-    if is_in_zone("home", agent_x, agent_y - SH/2):
-        agent_state["time_indoors"] += dt
-        agent_state["time_outdoors"] = 0
-        agent_state["want_to_explore"] += dt * 0.5
-        agent_state["want_to_go_home"] = 0
-    else:
-        agent_state["time_outdoors"] += dt
-        agent_state["time_indoors"] = 0
-        agent_state["want_to_explore"] = 0
-        agent_state["want_to_go_home"] += dt * 0.5
+    # === Запись поведения ===
+    if recording:
+        col = int(adam_x // TILE_W)
+        row = int(adam_y // TILE_H)
+        state = extract_vision(col, row)
+        action = get_action_from_keys(keys)
+        if action:
+            demo_buffer.append({"state": state, "action": action})
 
-    # === Агент выбирает направление ===
-    directions = {
-        (1, 0): "right",
-        (-1, 0): "left",
-        (0, -1): "up",
-        (0, 1): "down"
-    }
-    walkable_dirs = []
-    for (dx, dy), _ in directions.items():
-        ax = dx * speed
-        ay = dy * speed
-        test_rect = pygame.Rect(agent_x + ax - FOOT_W/2, agent_y + ay - FOOT_H, FOOT_W, FOOT_H)
+    # === AI-агент ===
+    if repeating and model:
+        col = int(agent_x // TILE_W)
+        row = int(agent_y // TILE_H)
+        state = extract_vision(col, row)
+        action = model_predict_action(state)
 
-        a_c0 = max(0, test_rect.left   // TILE_W)
-        a_c1 = min(MAP_COLS, test_rect.right  // TILE_W + 1)
-        a_r0 = max(0, test_rect.top    // TILE_H)
-        a_r1 = min(MAP_ROWS, test_rect.bottom // TILE_H + 1)
+        ax = ay = 0
+        if action == "left":  ax = -speed
+        if action == "right": ax = speed
+        if action == "up":    ay = -speed
+        if action == "down":  ay = speed
 
-        collision = False
-        for r in range(a_r0, a_r1):
-            for c in range(a_c0, a_c1):
+        agent_foot = pygame.Rect(
+            agent_x + ax - FOOT_W/2,
+            agent_y + ay - FOOT_H,
+            FOOT_W, FOOT_H
+        )
+
+        c0 = max(0, agent_foot.left // TILE_W)
+        c1 = min(MAP_COLS, agent_foot.right // TILE_W + 1)
+        r0 = max(0, agent_foot.top  // TILE_H)
+        r1 = min(MAP_ROWS, agent_foot.bottom // TILE_H + 1)
+
+        blocked = False
+        for r in range(r0, r1):
+            for c in range(c0, c1):
                 gid = map_gids[r*MAP_COLS + c]
                 if gid == 0: continue
                 shapes = coll_shapes.get(gid)
                 if shapes:
                     for s in shapes:
                         abs_r = pygame.Rect(c*TILE_W + s.x, r*TILE_H + s.y, s.w, s.h)
-                        if test_rect.colliderect(abs_r):
-                            collision = True
+                        if agent_foot.colliderect(abs_r):
+                            blocked = True
                             break
                 else:
                     abs_r = pygame.Rect(c*TILE_W, r*TILE_H, TILE_W, TILE_H)
-                    if test_rect.colliderect(abs_r):
-                        collision = True
-                if collision: break
-            if collision: break
+                    if agent_foot.colliderect(abs_r):
+                        blocked = True
+                if blocked: break
+            if blocked: break
 
-        if not collision:
-            walkable_dirs.append((dx, dy))
+        if not blocked:
+            agent_x += ax
+            agent_y += ay
 
-    move_dir = None
-    if agent_state["want_to_explore"] > agent_state["want_to_go_home"]:
-        if walkable_dirs:
-            move_dir = walkable_dirs[0]
-    elif agent_state["want_to_go_home"] > 0:
-        if walkable_dirs:
-            move_dir = walkable_dirs[-1]
-
-    if move_dir:
-        agent_x += move_dir[0] * speed
-        agent_y += move_dir[1] * speed
-
+    # === Анимация ===
     if moving:
         anim_timer += ANIM_SPEED
         if anim_timer >= 1:
@@ -256,8 +303,9 @@ while running:
     else:
         frame_index = 0
 
-    # отрисовка
+    # === Отрисовка ===
     screen.fill(BG_COLOR)
+
     for r in range(MAP_ROWS):
         for c in range(MAP_COLS):
             gid = map_gids[r*MAP_COLS + c]
@@ -268,27 +316,6 @@ while running:
     frame = adam_frames[current_dir][frame_index]
     screen.blit(frame, (adam_x - SW/2, adam_y - SH))
     pygame.draw.rect(screen, (255, 0, 0), (agent_x - SW/2, agent_y - SH, SW, SH), 2)
-
-    # визуализация зоны home
-    home_rect = zone_rects.get("home")
-    if home_rect:
-        surf = pygame.Surface((home_rect.w, home_rect.h), pygame.SRCALPHA)
-        surf.fill((0, 0, 255, 60))
-        screen.blit(surf, (home_rect.x, home_rect.y))
-        label = font.render("home", True, (255, 255, 255))
-        screen.blit(label, (home_rect.x + 4, home_rect.y + 4))
-
-    # правая панель
-    panel_x = WINDOW_WIDTH + 10
-    lines = [
-        f"indoors: {agent_state['time_indoors']:.1f}s",
-        f"outdoors: {agent_state['time_outdoors']:.1f}s",
-        f"go home: {agent_state['want_to_go_home']:.1f}",
-        f"explore: {agent_state['want_to_explore']:.1f}"
-    ]
-    for i, line in enumerate(lines):
-        text = font.render(line, True, (255, 255, 255))
-        screen.blit(text, (panel_x, 30 + i * 30))
 
     pygame.display.flip()
 
